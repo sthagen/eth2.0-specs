@@ -55,6 +55,8 @@ It consists of four main sections:
       - [Attestation subnet bitfield](#attestation-subnet-bitfield)
       - [Interop](#interop-5)
       - [Mainnet](#mainnet-5)
+        - [`eth2` field](#eth2-field)
+        - [General capabilities](#general-capabilities)
     - [Topic advertisement](#topic-advertisement)
       - [Mainnet](#mainnet-6)
 - [Design decision rationale](#design-decision-rationale)
@@ -88,13 +90,14 @@ It consists of four main sections:
     - [Why are we sending entire objects in the pubsub and not just hashes?](#why-are-we-sending-entire-objects-in-the-pubsub-and-not-just-hashes)
     - [Should clients gossip blocks if they *cannot* validate the proposer signature due to not yet being synced, not knowing the head block, etc?](#should-clients-gossip-blocks-if-they-cannot-validate-the-proposer-signature-due-to-not-yet-being-synced-not-knowing-the-head-block-etc)
     - [How are we going to discover peers in a gossipsub topic?](#how-are-we-going-to-discover-peers-in-a-gossipsub-topic)
+    - [How should fork version be used in practice?](#how-should-fork-version-be-used-in-practice)
   - [Req/Resp](#reqresp)
     - [Why segregate requests into dedicated protocol IDs?](#why-segregate-requests-into-dedicated-protocol-ids)
     - [Why are messages length-prefixed with a protobuf varint in the SSZ-encoding?](#why-are-messages-length-prefixed-with-a-protobuf-varint-in-the-ssz-encoding)
     - [Why do we version protocol strings with ordinals instead of semver?](#why-do-we-version-protocol-strings-with-ordinals-instead-of-semver)
     - [Why is it called Req/Resp and not RPC?](#why-is-it-called-reqresp-and-not-rpc)
     - [Why do we allow empty responses in block requests?](#why-do-we-allow-empty-responses-in-block-requests)
-    - [Why does `BeaconBlocksByRange` let the server choose which chain to send blocks from?](#why-does-beaconblocksbyrange-let-the-server-choose-which-chain-to-send-blocks-from)
+    - [Why does `BeaconBlocksByRange` let the server choose which branch to send blocks from?](#why-does-beaconblocksbyrange-let-the-server-choose-which-branch-to-send-blocks-from)
     - [What's the effect of empty slots on the sync algorithm?](#whats-the-effect-of-empty-slots-on-the-sync-algorithm)
   - [Discovery](#discovery)
     - [Why are we using discv5 and not libp2p Kademlia DHT?](#why-are-we-using-discv5-and-not-libp2p-kademlia-dht)
@@ -216,7 +219,13 @@ The following gossipsub [parameters](https://github.com/libp2p/specs/tree/master
 
 ### Topics and messages
 
-Topics are plain UTF-8 strings and are encoded on the wire as determined by protobuf (gossipsub messages are enveloped in protobuf messages). Topic strings have form: `/eth2/TopicName/TopicEncoding`. This defines both the type of data being sent on the topic and how the data field of the message is encoded.
+Topics are plain UTF-8 strings and are encoded on the wire as determined by protobuf (gossipsub messages are enveloped in protobuf messages). Topic strings have form: `/eth2/ForkDigestValue/Name/Encoding`. This defines both the type of data being sent on the topic and how the data field of the message is encoded.
+
+- `ForkDigestValue` - the lowercase hex-encoded (no "0x" prefix) bytes of `compute_fork_digest(current_fork_version, genesis_validators_root)` where
+    - `current_fork_version` is the fork version of the epoch of the message to be sent on the topic
+    - `genesis_validators_root` is the static `Root` found in `state.genesis_validators_root`
+- `Name` - see table below
+- `Encoding` - the encoding strategy describes a specific representation of bytes that will be transmitted over the wire. See the [Encodings](#Encoding-strategies) section for further details.
 
 Each gossipsub [message](https://github.com/libp2p/go-libp2p-pubsub/blob/master/pb/rpc.proto#L17-L24) has a maximum size of `GOSSIP_MAX_SIZE`. Clients MUST reject (fail validation) messages that are over this size limit. Likewise, clients MUST NOT emit or propagate messages larger than this limit.
 
@@ -229,7 +238,7 @@ where `base64` is the [URL-safe base64 alphabet](https://tools.ietf.org/html/rfc
 
 The payload is carried in the `data` field of a gossipsub message, and varies depending on the topic:
 
-| Topic                                          | Message Type            |
+| Name                                           | Message Type            |
 |------------------------------------------------|-------------------------|
 | beacon_block                                   | SignedBeaconBlock       |
 | beacon_aggregate_and_proof                     | SignedAggregateAndProof |
@@ -247,7 +256,7 @@ When processing incoming gossip, clients MAY descore or disconnect peers who fai
 
 #### Global topics
 
-There are two primary global topics used to propagate beacon blocks and aggregate attestations to all nodes on the network. Their `TopicName`s are:
+There are two primary global topics used to propagate beacon blocks and aggregate attestations to all nodes on the network. Their `Name`s are:
 
 - `beacon_block` - This topic is used solely for propagating new signed beacon blocks to all nodes on the networks. Signed blocks are sent in their entirety. The following validations MUST pass before forwarding the `signed_beacon_block` on the network
     - The block is not from a future slot (with a `MAXIMUM_GOSSIP_CLOCK_DISPARITY` allowance) -- i.e. validate that `signed_beacon_block.message.slot <= current_slot` (a client MAY queue future blocks for processing at the appropriate slot).
@@ -265,7 +274,7 @@ There are two primary global topics used to propagate beacon blocks and aggregat
     - The aggregator signature, `signed_aggregate_and_proof.signature`, is valid.
     - The signature of `aggregate` is valid.
 
-Additional global topics are used to propagate lower frequency validator messages. Their `TopicName`s are:
+Additional global topics are used to propagate lower frequency validator messages. Their `Name`s are:
 
 - `voluntary_exit` - This topic is used solely for propagating signed voluntary validator exits to proposers on the network. Signed voluntary exits are sent in their entirety. The following validations MUST pass before forwarding the `signed_voluntary_exit` on to the network
     - The voluntary exit is the first valid voluntary exit received for the validator with index `signed_voluntary_exit.message.validator_index`.
@@ -280,7 +289,7 @@ Additional global topics are used to propagate lower frequency validator message
 
 #### Attestation subnets
 
-Attestation subnets are used to propagate unaggregated attestations to subsections of the network. Their `TopicName`s are:
+Attestation subnets are used to propagate unaggregated attestations to subsections of the network. Their `Name`s are:
 
 - `committee_index{subnet_id}_beacon_attestation` - These topics are used to propagate unaggregated attestations to the subnet `subnet_id` (typically beacon and persistent committees) to be aggregated before being gossiped to `beacon_aggregate_and_proof`. The following validations MUST pass before forwarding the `attestation` on the subnet.
     - The attestation's committee index (`attestation.data.index`) is for the correct subnet.
@@ -414,7 +423,7 @@ Here, `result` represents the 1-byte response code.
 
 The token of the negotiated protocol ID specifies the type of encoding to be used for the req/resp interaction. Two values are possible at this time:
 
--  `ssz`: the contents are [SSZ-encoded](../../ssz/simple-serialize.md). This encoding type MUST be supported by all clients. For objects containing a single field, only the field is SSZ-encoded not a container with a single field. For example, the `BeaconBlocksByRoot` request is an SSZ-encoded list of `Bytes32`'s.
+-  `ssz`: the contents are [SSZ-encoded](../../ssz/simple-serialize.md). This encoding type MUST be supported by all clients. For objects containing a single field, only the field is SSZ-encoded not a container with a single field. For example, the `BeaconBlocksByRoot` request is an SSZ-encoded list of `Root`'s.
 -  `ssz_snappy`: The contents are SSZ-encoded and then compressed with [Snappy](https://github.com/google/snappy). MAY be supported in the interoperability testnet; MUST be supported in mainnet.
 
 #### SSZ-encoding strategy (with or without Snappy)
@@ -466,16 +475,18 @@ constituents individually as `response_chunk`s. For example, the
 Request, Response Content:
 ```
 (
-  head_fork_version: Bytes4
-  finalized_root: Bytes32
-  finalized_epoch: uint64
-  head_root: Bytes32
-  head_slot: uint64
+  fork_digest: ForkDigest
+  finalized_root: Root
+  finalized_epoch: Epoch
+  head_root: Root
+  head_slot: Slot
 )
 ```
 The fields are, as seen by the client at the time of sending the message:
 
-- `head_fork_version`: The beacon_state `Fork` version.
+- `fork_digest`: The node's `ForkDigest` (`compute_fork_digest(current_fork_version, genesis_validators_root)`) where
+    - `current_fork_version` is the fork version at the node's current epoch defined by the wall-clock time (not necessarily the epoch to which the node is sync)
+    - `genesis_validators_root` is the static `Root` found in `state.genesis_validators_root`
 - `finalized_root`: `state.finalized_checkpoint.root` for the state corresponding to the head block.
 - `finalized_epoch`: `state.finalized_checkpoint.epoch` for the state corresponding to the head block.
 - `head_root`: The hash_tree_root root of the current head block.
@@ -489,7 +500,7 @@ The response MUST consist of a single `response_chunk`.
 
 Clients SHOULD immediately disconnect from one another following the handshake above under the following conditions:
 
-1. If `head_fork_version` does not match the expected fork version at the epoch of the `head_slot`, since the client’s chain is on another fork. `head_fork_version` can also be used to segregate testnets.
+1. If `fork_digest` does not match the node's local `fork_digest`, since the client’s chain is on another fork.
 2. If the (`finalized_root`, `finalized_epoch`) shared by the peer is not in the client's chain at the expected epoch. For example, if Peer 1 sends (root, epoch) of (A, 5) and Peer 2 sends (B, 3) but Peer 1 has root C at epoch 3, then Peer 1 would disconnect because it knows that their chains are irreparably disjoint.
 
 Once the handshake completes, the client with the lower `finalized_epoch` or `head_slot` (if the clients have equal `finalized_epoch`s) SHOULD request beacon blocks from its counterparty via the `BeaconBlocksByRange` request.
@@ -527,7 +538,7 @@ The response MUST consist of a single `response_chunk`.
 Request Content:
 ```
 (
-  start_slot: uint64
+  start_slot: Slot
   count: uint64
   step: uint64
 )
@@ -547,7 +558,8 @@ Requests count beacon blocks from the peer starting from `start_slot`, leading u
 The request MUST be encoded as an SSZ-container.
 
 The response MUST consist of zero or more `response_chunk`. Each _successful_ `response_chunk` MUST contain a single `SignedBeaconBlock` payload.
-Clients MUST support requesting blocks since the start of the weak subjectivity period and up to the given `head_block_root`.
+
+Clients MUST keep a record of signed blocks seen since the since the start of the weak subjectivity period and MUST support serving requests of blocks up to their own `head_block_root`.
 
 Clients MUST respond with at least one block, if they have it and it exists in the range. Clients MAY limit the number of blocks in the response.
 
@@ -565,7 +577,7 @@ Request Content:
 
 ```
 (
-  []Bytes32
+  []Root
 )
 ```
 
@@ -631,6 +643,38 @@ In the interoperability testnet, all peers will support all capabilities defined
 Nonetheless, ENRs MUST carry a generic `eth2` key with nil value, denoting that the peer is indeed an Eth2 peer, in order to eschew connecting to Eth 1.0 peers.
 
 #### Mainnet
+
+##### `eth2` field
+
+ENRs MUST carry a generic `eth2` key with an 16-byte value of the node's current fork digest, next fork version, and next fork epoch to ensure connections are made with peers on the intended eth2 network.
+
+| Key          | Value               |
+|:-------------|:--------------------|
+| `eth2`       | SSZ `ENRForkID`        |
+
+Specifically, the value of the `eth2` key MUST be the following SSZ encoded object (`ENRForkID`)
+
+```
+(
+    fork_digest: ForkDigest
+    next_fork_version: Version
+    next_fork_epoch: Epoch
+)
+```
+
+where the fields of `ENRForkID` are defined as
+
+* `fork_digest` is `compute_fork_digest(current_fork_version, genesis_validators_root)` where
+    * `current_fork_version` is the fork version at the node's current epoch defined by the wall-clock time (not necessarily the epoch to which the node is sync)
+    * `genesis_validators_root` is the static `Root` found in `state.genesis_validators_root`
+* `next_fork_version` is the fork version corresponding to the next planned hard fork at a future epoch. If no future fork is planned, set `next_fork_version = current_fork_version` to signal this fact
+* `next_fork_epoch` is the epoch at which the next fork is planned and the `current_fork_version` will be updated. If no future fork is planned, set `next_fork_epoch = FAR_FUTURE_EPOCH` to signal this fact
+
+Clients SHOULD connect to peers with `fork_digest`, `next_fork_version`, and `next_fork_epoch` that match local values.
+
+Clients MAY connect to peers with the same `fork_digest` but a different `next_fork_version`/`next_fork_epoch`. Unless `ENRForkID` is manually updated to matching prior to the earlier `next_fork_epoch` of the two clients, these connecting clients will be unable to successfully interact starting at the earlier `next_fork_epoch`.
+
+##### General capabilities
 
 On mainnet, ENRs MUST include a structure enumerating the capabilities offered by the peer in an efficient manner. The concrete solution is currently undefined. Proposals include using namespaced bloom filters mapping capabilities to specific protocol IDs supported under that capability.
 
@@ -781,9 +825,9 @@ For future extensibility with almost zero overhead now (besides the extra bytes 
 
 ### How do we upgrade gossip channels (e.g. changes in encoding, compression)?
 
-Changing gossipsub/broadcasts requires a coordinated upgrade where all clients start publishing to the new topic together, for example during a hard fork.
+Changing gossipsub/broadcasts requires a coordinated upgrade where all clients start publishing to the new topic together, during a hard fork.
 
-One can envision a two-phase deployment as well where clients start listening to the new topic in the first phase then start publishing some time later, letting the traffic naturally move over to the new topic.
+When a node is preparing for upcoming tasks (e.g. validator duty lookahead) on a gossipsub topic, the node should join the topic of the future epoch in which the task is to occur in addition to listening to the topics for the current epoch.
 
 ### Why must all clients use the same gossip topic instead of one negotiated between each peer pair?
 
@@ -850,6 +894,14 @@ The prohibition of unverified-block-gossiping extends to nodes that cannot verif
 In Phase 0, peers for attestation subnets will be found using the `attnets` entry in the ENR.
 
 Although this method will be sufficient for early phases of Eth2, we aim to use the more appropriate discv5 topics for this and other similar tasks in the future. ENRs should ultimately not be used for this purpose. They are best suited to store identity, location, and capability information, rather than more volatile advertisements.
+
+### How should fork version be used in practice?
+
+Fork versions are to be manually updated (likely via incrementing) at each hard fork. This is to provide native domain separation for signatures as well as to aid in usefulness for identitying peers (via ENRs) and versioning network protocols (e.g. using fork version to naturally version gossipsub topics).
+
+`BeaconState.genesis_validators_root` is mixed into signature and ENR fork domains (`ForkDigest`) to aid in the ease of domain separation between chains. This allows fork versions to safely be reused across chains except for the case of contentious forks using the same genesis. In these cases, extra care should be taken to isolate fork versions (e.g. flip a high order bit in all future versions of one of the chains).
+
+A node locally stores all previous and future planned fork versions along with the each fork epoch. This allows for handling sync and processing messages starting from past forks/epochs.
 
 ## Req/Resp
 
@@ -921,17 +973,17 @@ Assuming option 0 with no special `null` encoding, consider a request for slots 
 
 Failing to provide blocks that nodes "should" have is reason to trust a peer less - for example, if a particular peer gossips a block, it should have access to its parent. If a request for the parent fails, it's indicative of poor peer quality since peers should validate blocks before gossiping them.
 
-### Why does `BeaconBlocksByRange` let the server choose which chain to send blocks from?
+### Why does `BeaconBlocksByRange` let the server choose which branch to send blocks from?
 
 When connecting, the `Status` message gives an idea about the sync status of a particular peer, but this changes over time. By the time a subsequent `BeaconBlockByRange` request is processed, the information may be stale, and the responding side might have moved on to a new finalization point and pruned blocks around the previous head and finalized blocks.
 
-To avoid this race condition, we allow the responding side to choose which chain to send to the requesting client. The requesting client then goes on to validate the blocks and incorporate them in their own database - because they follow the same rules, they should at this point arrive at the same chain.
+To avoid this race condition, we allow the responding side to choose which branch to send to the requesting client. The requesting client then goes on to validate the blocks and incorporate them in their own database - because they follow the same rules, they should at this point arrive at the same canonical chain.
 
 ### What's the effect of empty slots on the sync algorithm?
 
-When syncing one can only tell that a slot has been skipped on a particular chain by examining subsequent blocks and analyzing the graph formed by the parent root. Because the server side may choose to omit blocks in the response for any reason, clients must validate the graph and be prepared to fill in gaps.
+When syncing one can only tell that a slot has been skipped on a particular branch by examining subsequent blocks and analyzing the graph formed by the parent root. Because the server side may choose to omit blocks in the response for any reason, clients must validate the graph and be prepared to fill in gaps.
 
-For example, if a peer responds with blocks [2, 3] when asked for [2, 3, 4], clients may not assume that block 4 doesn't exist - it merely means that the responding peer did not send it (they may not have it yet or may maliciously be trying to hide it) and successive blocks will be needed to determine if there exists a block at slot 4 in this particular chain.
+For example, if a peer responds with blocks [2, 3] when asked for [2, 3, 4], clients may not assume that block 4 doesn't exist - it merely means that the responding peer did not send it (they may not have it yet or may maliciously be trying to hide it) and successive blocks will be needed to determine if there exists a block at slot 4 in this particular branch.
 
 ## Discovery
 
