@@ -1,3 +1,4 @@
+from enum import Enum, auto
 from setuptools import setup, find_packages, Command
 from setuptools.command.build_py import build_py
 from distutils import dir_util
@@ -14,6 +15,13 @@ class SpecObject(NamedTuple):
     custom_types: Dict[str, str]
     constants: Dict[str, str]
     ssz_objects: Dict[str, str]
+    dataclasses: Dict[str, str]
+
+
+class CodeBlockType(Enum):
+    SSZ = auto()
+    DATACLASS = auto()
+    FUNCTION = auto()
 
 
 def get_spec(file_name: str) -> SpecObject:
@@ -28,8 +36,9 @@ def get_spec(file_name: str) -> SpecObject:
     functions: Dict[str, str] = {}
     constants: Dict[str, str] = {}
     ssz_objects: Dict[str, str] = {}
+    dataclasses: Dict[str, str] = {}
     function_matcher = re.compile(FUNCTION_REGEX)
-    is_ssz = False
+    block_type = CodeBlockType.FUNCTION
     custom_types: Dict[str, str] = {}
     for linenum, line in enumerate(open(file_name).readlines()):
         line = line.rstrip()
@@ -43,20 +52,26 @@ def get_spec(file_name: str) -> SpecObject:
         else:
             # Handle function definitions & ssz_objects
             if pulling_from is not None:
-                # SSZ Object
                 if len(line) > 18 and line[:6] == 'class ' and line[-12:] == '(Container):':
                     name = line[6:-12]
                     # Check consistency with markdown header
                     assert name == current_name
-                    is_ssz = True
-                # function definition
+                    block_type = CodeBlockType.SSZ
+                elif line[:10] == '@dataclass':
+                    block_type = CodeBlockType.DATACLASS
                 elif function_matcher.match(line) is not None:
                     current_name = function_matcher.match(line).group(0)
-                    is_ssz = False
-                if is_ssz:
+                    block_type = CodeBlockType.FUNCTION
+
+                if block_type == CodeBlockType.SSZ:
                     ssz_objects[current_name] = ssz_objects.get(current_name, '') + line + '\n'
-                else:
+                elif block_type == CodeBlockType.DATACLASS:
+                    dataclasses[current_name] = dataclasses.get(current_name, '') + line + '\n'
+                elif block_type == CodeBlockType.FUNCTION:
                     functions[current_name] = functions.get(current_name, '') + line + '\n'
+                else:
+                    pass
+
             # Handle constant and custom types table entries
             elif pulling_from is None and len(line) > 0 and line[0] == '|':
                 row = line[1:].split('|')
@@ -75,7 +90,7 @@ def get_spec(file_name: str) -> SpecObject:
                         constants[row[0]] = row[1].replace('**TBD**', '2**32')
                     elif row[1].startswith('uint') or row[1].startswith('Bytes'):
                         custom_types[row[0]] = row[1]
-    return SpecObject(functions, custom_types, constants, ssz_objects)
+    return SpecObject(functions, custom_types, constants, ssz_objects, dataclasses)
 
 
 CONFIG_LOADER = '''
@@ -94,9 +109,9 @@ from dataclasses import (
 
 from lru import LRU
 
-from eth2spec.utils.ssz.ssz_impl import hash_tree_root
+from eth2spec.utils.ssz.ssz_impl import hash_tree_root, copy, uint_to_bytes
 from eth2spec.utils.ssz.ssz_typing import (
-    View, boolean, Container, List, Vector, uint64,
+    View, boolean, Container, List, Vector, uint8, uint32, uint64,
     Bytes1, Bytes4, Bytes32, Bytes48, Bytes96, Bitlist, Bitvector,
 )
 from eth2spec.utils import bls
@@ -108,7 +123,7 @@ SSZObject = TypeVar('SSZObject', bound=View)
 PHASE1_IMPORTS = '''from eth2spec.phase0 import spec as phase0
 from eth2spec.config.config_util import apply_constants_config
 from typing import (
-    Any, Dict, Set, Sequence, NewType, Tuple, TypeVar, Callable
+    Any, Dict, Set, Sequence, NewType, Tuple, TypeVar, Callable, Optional
 )
 
 from dataclasses import (
@@ -118,10 +133,10 @@ from dataclasses import (
 
 from lru import LRU
 
-from eth2spec.utils.ssz.ssz_impl import hash_tree_root
+from eth2spec.utils.ssz.ssz_impl import hash_tree_root, copy, uint_to_bytes
 from eth2spec.utils.ssz.ssz_typing import (
-    View, boolean, Container, List, Vector, uint64, uint8, bit,
-    ByteList, Bytes1, Bytes4, Bytes32, Bytes48, Bytes96, Bitlist, Bitvector,
+    View, boolean, Container, List, Vector, uint8, uint32, uint64, bit,
+    ByteList, ByteVector, Bytes1, Bytes4, Bytes32, Bytes48, Bytes96, Bitlist, Bitvector,
 )
 from eth2spec.utils import bls
 
@@ -140,20 +155,15 @@ SUNDRY_CONSTANTS_FUNCTIONS = '''
 def ceillog2(x: uint64) -> int:
     return (x - 1).bit_length()
 '''
-SUNDRY_FUNCTIONS = '''
-# Monkey patch hash cache
-_hash = hash
-hash_cache: Dict[bytes, Bytes32] = {}
-
-
-def get_eth1_data(distance: uint64) -> Bytes32:
-    return hash(distance)
-
-
-def hash(x: bytes) -> Bytes32:  # type: ignore
-    if x not in hash_cache:
-        hash_cache[x] = Bytes32(_hash(x))
-    return hash_cache[x]
+PHASE0_SUNDRY_FUNCTIONS = '''
+def get_eth1_data(block: Eth1Block) -> Eth1Data:
+    """
+    A stub function return mocking Eth1Data.
+    """
+    return Eth1Data(
+        deposit_root=block.deposit_root,
+        deposit_count=block.deposit_count,
+        block_hash=hash_tree_root(block))
 
 
 def cache_this(key_fn, value_fn, lru_size):  # type: ignore
@@ -183,10 +193,10 @@ get_base_reward = cache_this(
     lambda state, index: (state.validators.hash_tree_root(), state.slot, index),
     _get_base_reward, lru_size=2048)
 
-_get_committee_count_at_slot = get_committee_count_at_slot
-get_committee_count_at_slot = cache_this(
+_get_committee_count_per_slot = get_committee_count_per_slot
+get_committee_count_per_slot = cache_this(
     lambda state, epoch: (state.validators.hash_tree_root(), epoch),
-    _get_committee_count_at_slot, lru_size=SLOTS_PER_EPOCH * 3)
+    _get_committee_count_per_slot, lru_size=SLOTS_PER_EPOCH * 3)
 
 _get_active_validator_indices = get_active_validator_indices
 get_active_validator_indices = cache_this(
@@ -210,11 +220,22 @@ get_matching_head_attestations = cache_this(
 
 _get_attesting_indices = get_attesting_indices
 get_attesting_indices = cache_this(
-    lambda state, data, bits: (state.validators.hash_tree_root(), data.hash_tree_root(), bits.hash_tree_root()),
+    lambda state, data, bits: (
+        state.randao_mixes.hash_tree_root(),
+        state.validators.hash_tree_root(), data.hash_tree_root(), bits.hash_tree_root()
+    ),
     _get_attesting_indices, lru_size=SLOTS_PER_EPOCH * MAX_COMMITTEES_PER_SLOT * 3)'''
 
 
-def objects_to_spec(spec_object: SpecObject, imports: str, fork: str) -> str:
+PHASE1_SUNDRY_FUNCTIONS = '''
+
+_get_start_shard = get_start_shard
+get_start_shard = cache_this(
+    lambda state, slot: (state.validators.hash_tree_root(), slot),
+    _get_start_shard, lru_size=SLOTS_PER_EPOCH * 3)'''
+
+
+def objects_to_spec(spec_object: SpecObject, imports: str, fork: str, ordered_class_objects: Dict[str, str]) -> str:
     """
     Given all the objects that constitute a spec, combine them into a single pyfile.
     """
@@ -234,7 +255,7 @@ def objects_to_spec(spec_object: SpecObject, imports: str, fork: str) -> str:
         if k == "BLS12_381_Q":
             spec_object.constants[k] += "  # noqa: E501"
     constants_spec = '\n'.join(map(lambda x: '%s = %s' % (x, spec_object.constants[x]), spec_object.constants))
-    ssz_objects_instantiation_spec = '\n\n'.join(spec_object.ssz_objects.values())
+    ordered_class_objects_spec = '\n\n'.join(ordered_class_objects.values())
     spec = (
             imports
             + '\n\n' + f"fork = \'{fork}\'\n"
@@ -242,11 +263,13 @@ def objects_to_spec(spec_object: SpecObject, imports: str, fork: str) -> str:
             + '\n' + SUNDRY_CONSTANTS_FUNCTIONS
             + '\n\n' + constants_spec
             + '\n\n' + CONFIG_LOADER
-            + '\n\n' + ssz_objects_instantiation_spec
+            + '\n\n' + ordered_class_objects_spec
             + '\n\n' + functions_spec
-            + '\n' + SUNDRY_FUNCTIONS
-            + '\n'
+            + '\n' + PHASE0_SUNDRY_FUNCTIONS
     )
+    if fork == 'phase1':
+        spec += '\n' + PHASE1_SUNDRY_FUNCTIONS
+    spec += '\n'
     return spec
 
 
@@ -266,11 +289,12 @@ ignored_dependencies = [
     'bit', 'boolean', 'Vector', 'List', 'Container', 'BLSPubkey', 'BLSSignature',
     'Bytes1', 'Bytes4', 'Bytes32', 'Bytes48', 'Bytes96', 'Bitlist', 'Bitvector',
     'uint8', 'uint16', 'uint32', 'uint64', 'uint128', 'uint256',
-    'bytes', 'byte', 'ByteList', 'ByteVector'
+    'bytes', 'byte', 'ByteList', 'ByteVector',
+    'Dict', 'dict', 'field',
 ]
 
 
-def dependency_order_ssz_objects(objects: Dict[str, str], custom_types: Dict[str, str]) -> None:
+def dependency_order_class_objects(objects: Dict[str, str], custom_types: Dict[str, str]) -> None:
     """
     Determines which SSZ Object is dependent on which other and orders them appropriately
     """
@@ -307,13 +331,14 @@ def combine_spec_objects(spec0: SpecObject, spec1: SpecObject) -> SpecObject:
     """
     Takes in two spec variants (as tuples of their objects) and combines them using the appropriate combiner function.
     """
-    functions0, custom_types0, constants0, ssz_objects0 = spec0
-    functions1, custom_types1, constants1, ssz_objects1 = spec1
+    functions0, custom_types0, constants0, ssz_objects0, dataclasses0 = spec0
+    functions1, custom_types1, constants1, ssz_objects1, dataclasses1 = spec1
     functions = combine_functions(functions0, functions1)
     custom_types = combine_constants(custom_types0, custom_types1)
     constants = combine_constants(constants0, constants1)
     ssz_objects = combine_ssz_objects(ssz_objects0, ssz_objects1, custom_types)
-    return SpecObject(functions, custom_types, constants, ssz_objects)
+    dataclasses = combine_functions(dataclasses0, dataclasses1)
+    return SpecObject(functions, custom_types, constants, ssz_objects, dataclasses)
 
 
 fork_imports = {
@@ -329,9 +354,10 @@ def build_spec(fork: str, source_files: List[str]) -> str:
     for value in all_specs[1:]:
         spec_object = combine_spec_objects(spec_object, value)
 
-    dependency_order_ssz_objects(spec_object.ssz_objects, spec_object.custom_types)
+    class_objects = {**spec_object.ssz_objects, **spec_object.dataclasses}
+    dependency_order_class_objects(class_objects, spec_object.custom_types)
 
-    return objects_to_spec(spec_object, fork_imports[fork], fork)
+    return objects_to_spec(spec_object, fork_imports[fork], fork, class_objects)
 
 
 class PySpecCommand(Command):
@@ -373,11 +399,14 @@ class PySpecCommand(Command):
                 self.md_doc_paths = """
                     specs/phase0/beacon-chain.md
                     specs/phase0/fork-choice.md
+                    specs/phase0/validator.md
                     specs/phase1/custody-game.md
                     specs/phase1/beacon-chain.md
-                    specs/phase1/fraud-proofs.md
+                    specs/phase1/shard-transition.md
                     specs/phase1/fork-choice.md
                     specs/phase1/phase1-fork.md
+                    specs/phase1/shard-fork-choice.md
+                    specs/phase1/validator.md
                 """
             else:
                 raise Exception('no markdown files specified, and spec fork "%s" is unknown', self.spec_fork)
@@ -478,6 +507,7 @@ setup(
     url="https://github.com/ethereum/eth2.0-specs",
     include_package_data=False,
     package_data={'configs': ['*.yaml'],
+                 
                   'specs': ['**/*.md'],
                   'eth2spec': ['VERSION.txt']},
     package_dir={
@@ -497,9 +527,10 @@ setup(
         "eth-utils>=1.3.0,<2",
         "eth-typing>=2.1.0,<3.0.0",
         "pycryptodome==3.9.4",
-        "py_ecc==2.0.0",
+        "py_ecc==4.0.0",
+        "milagro_bls_binding==1.3.0",
         "dataclasses==0.6",
-        "remerkleable==0.1.13",
+        "remerkleable==0.1.17",
         "ruamel.yaml==0.16.5",
         "lru-dict==1.1.6"
     ]

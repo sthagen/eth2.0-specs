@@ -7,7 +7,7 @@
   - [Introduction](#introduction)
   - [Configuration](#configuration)
   - [Fork to Phase 1](#fork-to-phase-1)
-    - [Fork trigger.](#fork-trigger)
+    - [Fork trigger](#fork-trigger)
     - [Upgrading the state](#upgrading-the-state)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
@@ -35,17 +35,17 @@ Warning: this configuration is not definitive.
 | Name | Value |
 | - | - |
 | `PHASE_1_FORK_VERSION` | `Version('0x01000000')` |
-| `INITIAL_ACTIVE_SHARDS` | `2**6` (= 64) |
+| `PHASE_1_FORK_SLOT` | `Slot(0)` **TBD** |
 
 ## Fork to Phase 1
 
-### Fork trigger.
+### Fork trigger
 
-TBD. Social consensus, along with state conditions such as epoch boundary, finality, deposits, active validator count, etc. may be part of the decision process to trigger the fork.
+TBD. Social consensus, along with state conditions such as epoch boundary, finality, deposits, active validator count, etc. may be part of the decision process to trigger the fork. For now we assume the condition will be triggered at slot `PHASE_1_FORK_SLOT`, where `PHASE_1_FORK_SLOT % SLOTS_PER_EPOCH == 0`.
 
 ### Upgrading the state
 
-After `process_slots` of Phase 0 finishes, but before the first Phase 1 block is processed, an irregular state change is made to upgrade to Phase 1.
+After `process_slots` of Phase 0 finishes, if `state.slot == PHASE_1_FORK_SLOT`, an irregular state change is made to upgrade to Phase 1.
 
 ```python
 def upgrade_to_phase1(pre: phase0.BeaconState) -> BeaconState:
@@ -79,7 +79,7 @@ def upgrade_to_phase1(pre: phase0.BeaconState) -> BeaconState:
                 exit_epoch=phase0_validator.exit_epoch,
                 withdrawable_epoch=phase0_validator.withdrawable_epoch,
                 next_custody_secret_to_reveal=get_custody_period_for_validator(ValidatorIndex(i), epoch),
-                max_reveal_lateness=0,  # TODO custody refactor. Outdated? 
+                all_custody_secrets_revealed_epoch=FAR_FUTURE_EPOCH,
             ) for i, phase0_validator in enumerate(pre.validators)
         ),
         balances=pre.balances,
@@ -98,11 +98,11 @@ def upgrade_to_phase1(pre: phase0.BeaconState) -> BeaconState:
         current_justified_checkpoint=pre.current_justified_checkpoint,
         finalized_checkpoint=pre.finalized_checkpoint,
         # Phase 1
+        current_epoch_start_shard=Shard(0),
         shard_states=List[ShardState, MAX_SHARDS](
             ShardState(
-                slot=pre.slot,
+                slot=compute_previous_slot(pre.slot),
                 gasprice=MIN_GASPRICE,
-                data=Root(),
                 latest_block_root=Root(),
             ) for i in range(INITIAL_ACTIVE_SHARDS)
         ),
@@ -110,7 +110,7 @@ def upgrade_to_phase1(pre: phase0.BeaconState) -> BeaconState:
         current_light_committee=CompactCommittee(),  # computed after state creation
         next_light_committee=CompactCommittee(),
         # Custody game
-        custody_challenge_index=0,
+        exposed_derived_secrets=[()] * EARLY_DERIVED_SECRET_PENALTY_MAX_FUTURE_EPOCHS,
         # exposed_derived_secrets will fully default to zeroes
     )
     next_epoch = Epoch(epoch + 1)
