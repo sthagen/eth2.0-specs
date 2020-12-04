@@ -1,7 +1,5 @@
 # Ethereum 2.0 Phase 0 -- Beacon Chain Fork Choice
 
-**Notice**: This document is a work-in-progress for researchers and implementers.
-
 ## Table of contents
 <!-- TOC -->
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
@@ -98,14 +96,10 @@ This should be the genesis state for a full client.
 
 *Note* With regards to fork choice, block headers are interchangeable with blocks. The spec is likely to move to headers for reduced overhead in test vectors and better encapsulation. Full implementations store blocks as part of their database and will often use full blocks when dealing with production fork choice.
 
-_The block for `anchor_root` is incorrectly initialized to the block header, rather than the full block. This does not affect functionality but will be cleaned up in subsequent releases._
-
 ```python
-def get_forkchoice_store(anchor_state: BeaconState) -> Store:
-    anchor_block_header = copy(anchor_state.latest_block_header)
-    if anchor_block_header.state_root == Bytes32():
-        anchor_block_header.state_root = hash_tree_root(anchor_state)
-    anchor_root = hash_tree_root(anchor_block_header)
+def get_forkchoice_store(anchor_state: BeaconState, anchor_block: BeaconBlock) -> Store:
+    assert anchor_block.state_root == hash_tree_root(anchor_state)
+    anchor_root = hash_tree_root(anchor_block)
     anchor_epoch = get_current_epoch(anchor_state)
     justified_checkpoint = Checkpoint(epoch=anchor_epoch, root=anchor_root)
     finalized_checkpoint = Checkpoint(epoch=anchor_epoch, root=anchor_root)
@@ -115,7 +109,7 @@ def get_forkchoice_store(anchor_state: BeaconState) -> Store:
         justified_checkpoint=justified_checkpoint,
         finalized_checkpoint=finalized_checkpoint,
         best_justified_checkpoint=justified_checkpoint,
-        blocks={anchor_root: anchor_block_header},
+        blocks={anchor_root: copy(anchor_block)},
         block_states={anchor_root: copy(anchor_state)},
         checkpoint_states={justified_checkpoint: copy(anchor_state)},
     )
@@ -230,11 +224,10 @@ def get_head(store: Store) -> Root:
     blocks = get_filtered_block_tree(store)
     # Execute the LMD-GHOST fork choice
     head = store.justified_checkpoint.root
-    justified_slot = compute_start_slot_at_epoch(store.justified_checkpoint.epoch)
     while True:
         children = [
             root for root in blocks.keys()
-            if blocks[root].parent_root == head and blocks[root].slot > justified_slot
+            if blocks[root].parent_root == head
         ]
         if len(children) == 0:
             return head
@@ -359,7 +352,8 @@ def on_block(store: Store, signed_block: SignedBeaconBlock) -> None:
     assert get_ancestor(store, block.parent_root, finalized_slot) == store.finalized_checkpoint.root
 
     # Check the block is valid and compute the post-state
-    state = state_transition(pre_state, signed_block, True)
+    state = pre_state.copy()
+    state_transition(state, signed_block, True)
     # Add new block to the store
     store.blocks[hash_tree_root(block)] = block
     # Add new state for this block to the store
